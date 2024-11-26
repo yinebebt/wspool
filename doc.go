@@ -29,13 +29,19 @@
 	import (
 		"log"
 		"github.com/yinebebt/wspool"
+		"github.com/gorilla/websocket"
 	)
 
 	func main() {
+		dialer := websocket.Dialer{}
 		config := wspool.Config{
-					...
-			}
-		// Create a new WebSocket pool with a config.
+			MaxConn:           4,
+			MinConn:           1,
+			HealthCheckPeriod: time.Minute,
+			Dialer:            &dialer,
+			URL: "ws://localhost:6060/channel",
+		}
+		// Create a new WebSocket pool from config.
 		p, err := wspool.New(config)
 		if err != nil {
 			log.Fatalf("Failed to create WebSocket pool: %v", err)
@@ -47,14 +53,16 @@
 			log.Fatalf("Failed to get connection from pool: %v", err)
 		}
 
-		// Use the connection to send a message.
-		err = c.Send("Hello, WebSocket!")
+	    defer c.Release()   // Release the connection to the pool.
+
+		// send a message.
+		err = c.SendMessage("hi")
 		if err != nil {
 			log.Fatalf("Failed to send message: %v", err)
 		}
-
-		// Release the connection to the pool.
-		c.Release()
+		// read response
+		res,err := c.ReadMessage()
+		// handle response and error
 	}
 
 # Inspiration
