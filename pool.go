@@ -9,7 +9,7 @@ import (
 
 // Pool allows connection reuse
 type Pool struct {
-	conns             []*WsConn
+	conns             []*pooledConn
 	config            *Config
 	lock              sync.Mutex
 	activeConnections int32
@@ -52,14 +52,14 @@ func New(config Config) (*Pool, error) {
 
 	p := &Pool{
 		config:            &config,
-		conns:             make([]*WsConn, 0, config.MinConn),
+		conns:             make([]*pooledConn, 0, config.MinConn),
 		activeConnections: 0,
 		closeChan:         make(chan struct{}),
 	}
 
 	// Initialize minimum connections
 	for i := int32(0); i < config.MinConn; i++ {
-		conn, err := p.newConnection()
+		pc, err := p.newConnection()
 		if err != nil {
 			// Close already created connections on failure
 			for _, c := range p.conns {
@@ -67,7 +67,7 @@ func New(config Config) (*Pool, error) {
 			}
 			return nil, err
 		}
-		p.conns = append(p.conns, conn)
+		p.conns = append(p.conns, pc)
 	}
 
 	// Start the health check routine
@@ -78,17 +78,16 @@ func New(config Config) (*Pool, error) {
 	return p, nil
 }
 
-// newConnection creates a new WebSocket connection wrapped in WsConn.
-func (p *Pool) newConnection() (*WsConn, error) {
+// newConnection creates a new WebSocket connection wrapped in pooledConn.
+func (p *Pool) newConnection() (*pooledConn, error) {
 	conn, _, err := p.config.Dialer.Dial(p.config.URL, nil)
 	if err != nil {
 		return nil, err
 	}
 	p.activeConnections++
 
-	return &WsConn{
+	return &pooledConn{
 		c:          conn,
-		p:          p,
 		createdAt:  time.Now(),
 		lastUsedAt: time.Now(),
 	}, nil
@@ -106,26 +105,23 @@ func (p *Pool) Acquire() (*WsConn, error) {
 	// If there are idle connections, reuse them (skip stale ones)
 	now := time.Now()
 	for len(p.conns) > 0 {
-		conn := p.conns[len(p.conns)-1]
+		pc := p.conns[len(p.conns)-1]
 		p.conns = p.conns[:len(p.conns)-1]
-		if p.isIdleOrExpired(conn, now) {
-			conn.close()
+		if p.isIdleOrExpired(pc, now) {
+			pc.close()
 			p.activeConnections--
 			continue
 		}
-		conn.mu.Lock()
-		conn.released = false
-		conn.mu.Unlock()
-		return conn, nil
+		return &WsConn{pc: pc, p: p}, nil
 	}
 
 	// If pool size allows, create a new connection
 	if p.activeConnections < p.config.MaxConn {
-		conn, err := p.newConnection()
+		pc, err := p.newConnection()
 		if err != nil {
 			return nil, err
 		}
-		return conn, nil
+		return &WsConn{pc: pc, p: p}, nil
 	}
 
 	// Otherwise, no connection is available
@@ -133,21 +129,21 @@ func (p *Pool) Acquire() (*WsConn, error) {
 }
 
 // release returns a connection to the pool.
-func (p *Pool) release(conn *WsConn) {
+func (p *Pool) release(pc *pooledConn) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
 	if p.closed {
-		conn.close()
+		pc.close()
 		p.activeConnections--
 		return
 	}
 
 	if int32(len(p.conns)) < p.config.MinConn {
-		conn.lastUsedAt = time.Now()
-		p.conns = append(p.conns, conn)
+		pc.lastUsedAt = time.Now()
+		p.conns = append(p.conns, pc)
 	} else {
-		conn.close()
+		pc.close()
 		p.activeConnections--
 	}
 }
@@ -160,8 +156,8 @@ func (p *Pool) Close() {
 		defer p.lock.Unlock()
 
 		p.closed = true
-		for _, conn := range p.conns {
-			conn.close()
+		for _, pc := range p.conns {
+			pc.close()
 			p.activeConnections--
 		}
 		p.conns = nil
@@ -171,28 +167,28 @@ func (p *Pool) Close() {
 // maintainPoolSize ensures the pool respects min and max connection constraints.
 func (p *Pool) maintainPoolSize() {
 	for int32(len(p.conns)) < p.config.MinConn && p.activeConnections < p.config.MaxConn {
-		conn, err := p.newConnection()
+		pc, err := p.newConnection()
 		if err != nil {
 			break
 		}
-		p.conns = append(p.conns, conn)
+		p.conns = append(p.conns, pc)
 	}
 
 	for int32(len(p.conns)) > p.config.MaxConn {
-		conn := p.conns[len(p.conns)-1]
+		pc := p.conns[len(p.conns)-1]
 		p.conns = p.conns[:len(p.conns)-1]
-		conn.close()
+		pc.close()
 		p.activeConnections--
 	}
 }
 
 // isIdleOrExpired checks if a connection is idle or exceeds its lifetime.
-func (p *Pool) isIdleOrExpired(conn *WsConn, now time.Time) bool {
-	if p.config.MaxConnLifetime > 0 && now.Sub(conn.createdAt) > p.config.MaxConnLifetime {
+func (p *Pool) isIdleOrExpired(pc *pooledConn, now time.Time) bool {
+	if p.config.MaxConnLifetime > 0 && now.Sub(pc.createdAt) > p.config.MaxConnLifetime {
 		return true
 	}
 
-	if p.config.MaxConnIdleTime > 0 && now.Sub(conn.lastUsedAt) > p.config.MaxConnIdleTime {
+	if p.config.MaxConnIdleTime > 0 && now.Sub(pc.lastUsedAt) > p.config.MaxConnIdleTime {
 		return true
 	}
 
@@ -208,15 +204,20 @@ func (p *Pool) startHealthCheck() {
 		case <-ticker.C:
 			p.lock.Lock()
 
-			var healthy []*WsConn
+			if p.closed {
+				p.lock.Unlock()
+				return
+			}
+
+			var healthy []*pooledConn
 			now := time.Now()
-			for _, conn := range p.conns {
-				if p.isIdleOrExpired(conn, now) {
-					conn.close()
+			for _, pc := range p.conns {
+				if p.isIdleOrExpired(pc, now) {
+					pc.close()
 					p.activeConnections--
 					continue
 				}
-				healthy = append(healthy, conn)
+				healthy = append(healthy, pc)
 			}
 			p.conns = healthy
 
