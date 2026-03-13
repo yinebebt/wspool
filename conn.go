@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+var errConnClosed = errors.New("connection is closed")
+
 // pooledConn is the internal representation of a pooled WebSocket connection.
 type pooledConn struct {
 	c          *websocket.Conn
@@ -17,11 +19,16 @@ type pooledConn struct {
 }
 
 // close closes the underlying WebSocket connection.
+// It acquires both I/O mutexes to ensure no in-flight operations race with the close.
 func (pc *pooledConn) close() {
+	pc.wMu.Lock()
+	pc.rMu.Lock()
 	if pc.c != nil {
 		pc.c.Close()
 		pc.c = nil
 	}
+	pc.rMu.Unlock()
+	pc.wMu.Unlock()
 }
 
 // WsConn is an acquired connection handle from a Pool.
@@ -40,11 +47,15 @@ func (w *WsConn) SendMessage(message string) error {
 	w.mu.Unlock()
 
 	if pc == nil {
-		return errors.New("connection is closed")
+		return errConnClosed
 	}
 
 	pc.wMu.Lock()
 	defer pc.wMu.Unlock()
+
+	if pc.c == nil {
+		return errConnClosed
+	}
 
 	err := pc.c.WriteMessage(websocket.TextMessage, []byte(message))
 	if err == nil {
@@ -61,11 +72,15 @@ func (w *WsConn) SendJSON(v interface{}) error {
 	w.mu.Unlock()
 
 	if pc == nil {
-		return errors.New("connection is closed")
+		return errConnClosed
 	}
 
 	pc.wMu.Lock()
 	defer pc.wMu.Unlock()
+
+	if pc.c == nil {
+		return errConnClosed
+	}
 
 	err := pc.c.WriteJSON(v)
 	if err == nil {
@@ -82,11 +97,15 @@ func (w *WsConn) ReadMessage() ([]byte, error) {
 	w.mu.Unlock()
 
 	if pc == nil {
-		return nil, errors.New("connection is closed")
+		return nil, errConnClosed
 	}
 
 	pc.rMu.Lock()
 	defer pc.rMu.Unlock()
+
+	if pc.c == nil {
+		return nil, errConnClosed
+	}
 
 	_, data, err := pc.c.ReadMessage()
 	if err != nil {
@@ -104,11 +123,15 @@ func (w *WsConn) ReadJSON(v interface{}) error {
 	w.mu.Unlock()
 
 	if pc == nil {
-		return errors.New("connection is closed")
+		return errConnClosed
 	}
 
 	pc.rMu.Lock()
 	defer pc.rMu.Unlock()
+
+	if pc.c == nil {
+		return errConnClosed
+	}
 
 	if err := pc.c.ReadJSON(v); err != nil {
 		return err
@@ -130,8 +153,18 @@ func (w *WsConn) Close() error {
 	w.pc = nil
 	w.mu.Unlock()
 
-	err := pc.c.Close()
+	// Acquire both I/O mutexes to wait for in-flight operations to complete.
+	pc.wMu.Lock()
+	pc.rMu.Lock()
+	c := pc.c
 	pc.c = nil
+	pc.rMu.Unlock()
+	pc.wMu.Unlock()
+
+	var err error
+	if c != nil {
+		err = c.Close()
+	}
 
 	if w.p != nil {
 		w.p.lock.Lock()

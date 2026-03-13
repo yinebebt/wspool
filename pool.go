@@ -64,6 +64,7 @@ func New(config Config) (*Pool, error) {
 			// Close already created connections on failure
 			for _, c := range p.conns {
 				c.close()
+				p.activeConnections--
 			}
 			return nil, err
 		}
