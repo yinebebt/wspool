@@ -1,4 +1,5 @@
 # wspool
+
 WebSocket client with a connection pool
 
 ## Overview
@@ -30,6 +31,7 @@ and dynamically scaling the pool based on usage patterns.
 ```go
 import (
     "log"
+    "time"
     "github.com/yinebebt/wspool"
     "github.com/gorilla/websocket"
 )
@@ -42,7 +44,7 @@ func main() {
         HealthCheckPeriod: time.Minute,
         Dialer:            &dialer,
         URL:               "ws://localhost:6060/channel",
-	}
+    }
     // Create a new WebSocket pool from config.
     p, err := wspool.New(config)
     if err != nil {
@@ -54,18 +56,17 @@ func main() {
     if err != nil {
         log.Fatalf("Failed to get connection from pool: %v", err)
     }
-    defer c.Release()   // Release the connection to the pool.
+    defer c.Release() // Release the connection to the pool.
 
-	// Use the connection to send a message.
+    // Send a message.
     err = c.SendMessage("hi")
     if err != nil {
         log.Fatalf("Failed to send message: %v", err)
     }
-	
-	// read response
-	res,err := c.ReadMessage()
-	// handle response and error
 
+    // Read response.
+    _, err = c.ReadMessage()
+    // handle error
 }
 ```
 

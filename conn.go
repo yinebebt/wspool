@@ -11,77 +11,153 @@ import (
 type WsConn struct {
 	c          *websocket.Conn
 	p          *Pool
-	mu         sync.Mutex
+	mu         sync.Mutex // protects c, lastUsedAt, released
+	rMu        sync.Mutex // serializes read operations
+	wMu        sync.Mutex // serializes write operations
 	createdAt  time.Time
 	lastUsedAt time.Time
+	released   bool
 }
 
 // SendMessage sends a message over the WebSocket connection.
 func (w *WsConn) SendMessage(message string) error {
-	if w.c == nil {
-		return errors.New("connection is nil")
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.wMu.Lock()
+	defer w.wMu.Unlock()
 
+	w.mu.Lock()
+	c := w.c
+	w.mu.Unlock()
+
+	if c == nil {
+		return errors.New("connection is closed")
+	}
+
+	err := c.WriteMessage(websocket.TextMessage, []byte(message))
+
+	w.mu.Lock()
 	w.lastUsedAt = time.Now()
-	return w.c.WriteMessage(websocket.TextMessage, []byte(message))
+	w.mu.Unlock()
+
+	return err
 }
 
 // SendJSON sends a JSON-encoded message over the WebSocket connection.
 func (w *WsConn) SendJSON(v interface{}) error {
-	if w.c == nil {
-		return errors.New("connection is nil")
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.wMu.Lock()
+	defer w.wMu.Unlock()
 
+	w.mu.Lock()
+	c := w.c
+	w.mu.Unlock()
+
+	if c == nil {
+		return errors.New("connection is closed")
+	}
+
+	err := c.WriteJSON(v)
+
+	w.mu.Lock()
 	w.lastUsedAt = time.Now()
-	return w.c.WriteJSON(v)
+	w.mu.Unlock()
+
+	return err
 }
 
 // ReadMessage reads a response from the WebSocket connection.
 func (w *WsConn) ReadMessage() ([]byte, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.rMu.Lock()
+	defer w.rMu.Unlock()
 
-	_, data, err := w.c.ReadMessage()
+	w.mu.Lock()
+	c := w.c
+	w.mu.Unlock()
+
+	if c == nil {
+		return nil, errors.New("connection is closed")
+	}
+
+	_, data, err := c.ReadMessage()
 	if err != nil {
 		return nil, err
 	}
+
+	w.mu.Lock()
+	w.lastUsedAt = time.Now()
+	w.mu.Unlock()
+
 	return data, nil
 }
 
-// ReadJson reads a response as Json from the WebSocket connection and store in v.
-func (w *WsConn) ReadJson(v interface{}) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+// ReadJSON reads a JSON response from the WebSocket connection and stores in v.
+func (w *WsConn) ReadJSON(v interface{}) error {
+	w.rMu.Lock()
+	defer w.rMu.Unlock()
 
-	err := w.c.ReadJSON(v)
-	if err != nil {
+	w.mu.Lock()
+	c := w.c
+	w.mu.Unlock()
+
+	if c == nil {
+		return errors.New("connection is closed")
+	}
+
+	if err := c.ReadJSON(v); err != nil {
 		return err
 	}
+
+	w.mu.Lock()
+	w.lastUsedAt = time.Now()
+	w.mu.Unlock()
+
 	return nil
 }
 
-// Close closes w and removes it from the pool.
+// Close closes w's underlying connection. Returns an error if the connection
+// was already released back to the pool or already closed.
 func (w *WsConn) Close() error {
+	w.mu.Lock()
 	if w.c == nil {
-		return errors.New("connection is nil")
+		w.mu.Unlock()
+		return errors.New("connection is closed")
 	}
+	if w.released {
+		w.mu.Unlock()
+		return errors.New("connection was released back to pool")
+	}
+	c := w.c
+	w.c = nil
+	w.mu.Unlock()
+
+	err := c.Close()
+
+	if w.p != nil {
+		w.p.lock.Lock()
+		w.p.activeConnections--
+		w.p.lock.Unlock()
+	}
+	return err
+}
+
+// close is an internal method used by the pool when it already holds the pool lock.
+func (w *WsConn) close() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	err := w.c.Close()
-	w.c = nil
-	return err
+	if w.c != nil {
+		w.c.Close()
+		w.c = nil
+	}
 }
 
 // Release returns w to the pool it was acquired from.
 func (w *WsConn) Release() {
-	if w.c == nil || w.p == nil {
+	w.mu.Lock()
+	if w.c == nil || w.p == nil || w.released {
+		w.mu.Unlock()
 		return
 	}
+	w.released = true
+	w.mu.Unlock()
+
 	w.p.release(w)
-	w.c = nil
 }

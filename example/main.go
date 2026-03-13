@@ -1,14 +1,15 @@
-package wspool
+package main
 
 import (
 	"github.com/gorilla/websocket"
+	"github.com/yinebebt/wspool"
 	"log"
 	"time"
 )
 
 func main() {
 	dialer := websocket.Dialer{}
-	config := Config{
+	config := wspool.Config{
 		MaxConn:           4,
 		MinConn:           1,
 		HealthCheckPeriod: time.Minute,
@@ -16,7 +17,7 @@ func main() {
 		URL:               "ws://localhost:6060/channel",
 	}
 	// Create a new WebSocket pool from config.
-	p, err := New(config)
+	p, err := wspool.New(config)
 	if err != nil {
 		log.Fatalf("Failed to create WebSocket pool: %v", err)
 	}
