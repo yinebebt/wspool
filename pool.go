@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// Pool allows connection reuse
+// Pool manages a pool of reusable WebSocket connections.
 type Pool struct {
 	conns             []*WsConn
 	config            *Config
@@ -17,7 +17,7 @@ type Pool struct {
 	closeChan         chan struct{}
 }
 
-// Config is a struct for creating a pool.
+// Config specifies the configuration for a Pool.
 type Config struct {
 	// MaxConnLifetime is the duration since creation after which a connection will be automatically closed.
 	MaxConnLifetime time.Duration
@@ -41,6 +41,15 @@ type Config struct {
 func New(config Config) (*Pool, error) {
 	if config.Dialer == nil || config.URL == "" {
 		return nil, errors.New("dialer and URL must be provided")
+	}
+	if config.HealthCheckPeriod <= 0 {
+		return nil, errors.New("HealthCheckPeriod must be greater than zero")
+	}
+	if config.MaxConn <= 0 {
+		return nil, errors.New("MaxConn must be greater than zero")
+	}
+	if config.MinConn < 0 || config.MinConn > config.MaxConn {
+		return nil, errors.New("MinConn must be between 0 and MaxConn")
 	}
 
 	p := &Pool{
@@ -74,6 +83,7 @@ func (p *Pool) newConnection() (*WsConn, error) {
 	p.activeConnections++
 
 	return &WsConn{
+		p:          p,
 		c:          conn,
 		createdAt:  time.Now(),
 		lastUsedAt: time.Now(),
@@ -89,6 +99,7 @@ func (p *Pool) Acquire() (*WsConn, error) {
 	if len(p.conns) > 0 {
 		conn := p.conns[len(p.conns)-1]
 		p.conns = p.conns[:len(p.conns)-1]
+		conn.lastUsedAt = time.Now()
 		return conn, nil
 	}
 
@@ -98,7 +109,6 @@ func (p *Pool) Acquire() (*WsConn, error) {
 		if err != nil {
 			return nil, err
 		}
-		p.activeConnections++
 		return conn, nil
 	}
 
@@ -115,6 +125,7 @@ func (p *Pool) release(conn *WsConn) {
 		p.conns = append(p.conns, conn)
 	} else {
 		conn.Close()
+		p.activeConnections--
 	}
 
 	p.maintainPoolSize()
@@ -129,6 +140,7 @@ func (p *Pool) Close() {
 
 		for _, conn := range p.conns {
 			conn.Close()
+			p.activeConnections--
 		}
 		p.conns = nil
 	})
@@ -148,6 +160,7 @@ func (p *Pool) maintainPoolSize() {
 		conn := p.conns[len(p.conns)-1]
 		p.conns = p.conns[:len(p.conns)-1]
 		conn.Close()
+		p.activeConnections--
 	}
 }
 
@@ -178,6 +191,7 @@ func (p *Pool) startHealthCheck() {
 			for _, conn := range p.conns {
 				if p.isIdleOrExpired(conn, now) {
 					conn.Close()
+					p.activeConnections--
 					continue
 				}
 				activeConnections = append(activeConnections, conn)

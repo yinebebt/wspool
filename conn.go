@@ -18,24 +18,24 @@ type WsConn struct {
 
 // SendMessage sends a message over the WebSocket connection.
 func (w *WsConn) SendMessage(message string) error {
-	if w.c == nil {
-		return errors.New("connection is nil")
-	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.c == nil {
+		return errors.New("connection is nil")
+	}
 	w.lastUsedAt = time.Now()
 	return w.c.WriteMessage(websocket.TextMessage, []byte(message))
 }
 
 // SendJSON sends a JSON-encoded message over the WebSocket connection.
-func (w *WsConn) SendJSON(v interface{}) error {
-	if w.c == nil {
-		return errors.New("connection is nil")
-	}
+func (w *WsConn) SendJSON(v any) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.c == nil {
+		return errors.New("connection is nil")
+	}
 	w.lastUsedAt = time.Now()
 	return w.c.WriteJSON(v)
 }
@@ -53,35 +53,31 @@ func (w *WsConn) ReadMessage() ([]byte, error) {
 }
 
 // ReadJson reads a response as Json from the WebSocket connection and store in v.
-func (w *WsConn) ReadJson(v interface{}) error {
+func (w *WsConn) ReadJson(v any) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	err := w.c.ReadJSON(v)
-	if err != nil {
-		return err
-	}
-	return nil
+	return w.c.ReadJSON(v)
 }
 
 // Close closes w and removes it from the pool.
 func (w *WsConn) Close() error {
-	if w.c == nil {
-		return errors.New("connection is nil")
-	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.c == nil {
+		return errors.New("connection is nil")
+	}
 	err := w.c.Close()
 	w.c = nil
 	return err
 }
 
 // Release returns w to the pool it was acquired from.
+// The caller must not use w after calling Release.
 func (w *WsConn) Release() {
-	if w.c == nil || w.p == nil {
+	if w.p == nil {
 		return
 	}
 	w.p.release(w)
-	w.c = nil
 }
