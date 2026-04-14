@@ -49,6 +49,7 @@ func (w *WsConn) ReadMessage() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	w.lastUsedAt = time.Now()
 	return data, nil
 }
 
@@ -57,19 +58,43 @@ func (w *WsConn) ReadJson(v any) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	return w.c.ReadJSON(v)
+	if err := w.c.ReadJSON(v); err != nil {
+		return err
+	}
+	w.lastUsedAt = time.Now()
+	return nil
 }
 
-// Close closes w and removes it from the pool.
-func (w *WsConn) Close() error {
+// closeInternal closes the underlying WebSocket connection without touching pool state.
+// Pool methods use this when they already hold p.lock to avoid re-entrant locking.
+func (w *WsConn) closeInternal() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.c != nil {
+		w.c.Close()
+		w.c = nil
+	}
+}
 
+// Close closes the underlying connection and removes it from the pool.
+// w.mu is released before p.lock is acquired to preserve lock ordering:
+// pool internals always acquire p.lock then w.mu (via closeInternal),
+// never the reverse.
+func (w *WsConn) Close() error {
+	w.mu.Lock()
 	if w.c == nil {
+		w.mu.Unlock()
 		return errors.New("connection is nil")
 	}
 	err := w.c.Close()
 	w.c = nil
+	w.mu.Unlock()
+
+	if w.p != nil {
+		w.p.lock.Lock()
+		w.p.activeConnections--
+		w.p.lock.Unlock()
+	}
 	return err
 }
 
