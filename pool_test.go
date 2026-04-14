@@ -1,6 +1,7 @@
 package wspool
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -88,11 +89,11 @@ func TestAcquire_RespectsMaxConnAndCounter(t *testing.T) {
 	const max = 2
 	p := newPool(t, url, Config{MaxConn: max})
 
-	c1, err := p.Acquire()
+	c1, err := p.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("first Acquire: %v", err)
 	}
-	c2, err := p.Acquire()
+	c2, err := p.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("second Acquire: %v", err)
 	}
@@ -103,7 +104,9 @@ func TestAcquire_RespectsMaxConnAndCounter(t *testing.T) {
 	}
 	p.lock.Unlock()
 
-	if _, err := p.Acquire(); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := p.Acquire(ctx); err == nil {
 		t.Fatal("expected error when pool is exhausted")
 	}
 
@@ -121,7 +124,7 @@ func TestAcquire_UpdatesLastUsedAt(t *testing.T) {
 
 	time.Sleep(5 * time.Millisecond)
 
-	conn, err := p.Acquire()
+	conn, err := p.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
@@ -132,11 +135,63 @@ func TestAcquire_UpdatesLastUsedAt(t *testing.T) {
 	}
 }
 
+func TestAcquire_BlocksUntilReleased(t *testing.T) {
+	url := newEchoServer(t)
+	p := newPool(t, url, Config{MaxConn: 1})
+
+	c, err := p.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	// Release the connection after a short delay so the blocked Acquire can proceed.
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		c.Release()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	c2, err := p.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("blocked Acquire: %v", err)
+	}
+	defer c2.Release()
+}
+
+func TestAcquire_ContextCancelled(t *testing.T) {
+	url := newEchoServer(t)
+	p := newPool(t, url, Config{MaxConn: 1})
+
+	c, err := p.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer c.Release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	if _, err := p.Acquire(ctx); err == nil {
+		t.Fatal("expected context error, got nil")
+	}
+}
+
+func TestAcquire_PoolClosed(t *testing.T) {
+	url := newEchoServer(t)
+	p := newPool(t, url, Config{MaxConn: 2})
+	p.Close()
+
+	if _, err := p.Acquire(context.Background()); err == nil {
+		t.Fatal("expected error acquiring from closed pool")
+	}
+}
+
 func TestRelease_ReturnsToPool(t *testing.T) {
 	url := newEchoServer(t)
 	p := newPool(t, url, Config{MaxConn: 2})
 
-	conn, err := p.Acquire()
+	conn, err := p.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
@@ -151,7 +206,7 @@ func TestSendReceive(t *testing.T) {
 	url := newEchoServer(t)
 	p := newPool(t, url, Config{MaxConn: 1})
 
-	conn, err := p.Acquire()
+	conn, err := p.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
@@ -179,13 +234,57 @@ func TestSendReceive(t *testing.T) {
 			t.Fatalf("SendJSON: %v", err)
 		}
 		var got msg
-		if err := conn.ReadJson(&got); err != nil {
+		if err := conn.ReadJSON(&got); err != nil {
 			t.Fatalf("ReadJson: %v", err)
 		}
 		if got.Key != "value" {
 			t.Errorf("got %+v, want key=value", got)
 		}
 	})
+
+	t.Run("binary", func(t *testing.T) {
+		want := []byte{0x01, 0x02, 0x03}
+		if err := conn.SendBinary(want); err != nil {
+			t.Fatalf("SendBinary: %v", err)
+		}
+		got, err := conn.ReadBinary()
+		if err != nil {
+			t.Fatalf("ReadBinary: %v", err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+}
+
+func TestStats(t *testing.T) {
+	url := newEchoServer(t)
+	const max = 3
+	p := newPool(t, url, Config{MinConn: 1, MaxConn: max})
+
+	s := p.Stats()
+	if s.IdleConns != 1 {
+		t.Errorf("IdleConns = %d, want 1", s.IdleConns)
+	}
+	if s.ActiveConns != 1 {
+		t.Errorf("ActiveConns = %d, want 1", s.ActiveConns)
+	}
+	if s.MaxConns != max {
+		t.Errorf("MaxConns = %d, want %d", s.MaxConns, max)
+	}
+
+	conn, err := p.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	s = p.Stats()
+	if s.IdleConns != 0 {
+		t.Errorf("IdleConns after Acquire = %d, want 0", s.IdleConns)
+	}
+	if s.ActiveConns != 1 {
+		t.Errorf("ActiveConns after Acquire = %d, want 1", s.ActiveConns)
+	}
+	conn.Release()
 }
 
 func TestClose_Idempotent(t *testing.T) {
@@ -217,7 +316,7 @@ func TestHealthCheck_Eviction(t *testing.T) {
 		// Acquire all at once so the health check cannot evict between iterations.
 		conns := make([]*WsConn, 3)
 		for i := range conns {
-			if conns[i], err = p.Acquire(); err != nil {
+			if conns[i], err = p.Acquire(context.Background()); err != nil {
 				t.Fatalf("Acquire #%d: %v", i+1, err)
 			}
 		}
@@ -243,7 +342,7 @@ func TestHealthCheck_Eviction(t *testing.T) {
 		}
 		defer p.Close()
 
-		c, err := p.Acquire()
+		c, err := p.Acquire(context.Background())
 		if err != nil {
 			t.Fatalf("Acquire: %v", err)
 		}

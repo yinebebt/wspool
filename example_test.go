@@ -1,6 +1,7 @@
 package wspool_test
 
 import (
+	"context"
 	"log"
 	"time"
 
@@ -39,7 +40,7 @@ func ExamplePool_Acquire() {
 	}
 	defer pool.Close()
 
-	conn, err := pool.Acquire()
+	conn, err := pool.Acquire(context.Background())
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -61,7 +62,7 @@ func ExamplePool_Acquire() {
 		log.Fatal(err)
 	}
 	var resp Event
-	if err := conn.ReadJson(&resp); err != nil {
+	if err := conn.ReadJSON(&resp); err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("json: %s", resp.Name)
