@@ -1,4 +1,5 @@
 # wspool
+
 WebSocket client with a connection pool
 
 ## Overview
@@ -25,47 +26,50 @@ and dynamically scaling the pool based on usage patterns.
   use it concurrently.
 - **Flexible Usage**: Can be used either as a pooled client or as a standalone client.
 
-## Example-Usage
+## Example Usage
 
 ```go
+package main
+
 import (
     "log"
-    "github.com/yinebebt/wspool"
+    "time"
+
     "github.com/gorilla/websocket"
+    "github.com/yinebebt/wspool"
 )
 
 func main() {
-    dialer := websocket.Dialer{}
-    config := wspool.Config{
-        MaxConn:           4,
-        MinConn:           1,
-        HealthCheckPeriod: time.Minute,
-        Dialer:            &dialer,
-        URL:               "ws://localhost:6060/channel",
-	}
-    // Create a new WebSocket pool from config.
-    p, err := wspool.New(config)
+    pool, err := wspool.New(wspool.Config{
+        Dialer:            &websocket.Dialer{},
+        URL:               "ws://localhost:6060/ws",
+        MinConn:           2,
+        MaxConn:           10,
+        MaxConnLifetime:   30 * time.Minute,
+        MaxConnIdleTime:   5 * time.Minute,
+        HealthCheckPeriod: 30 * time.Second,
+    })
     if err != nil {
-        log.Fatalf("Failed to create WebSocket pool: %v", err)
+        log.Fatalf("create pool: %v", err)
     }
+    defer pool.Close()
 
     // Acquire a connection from the pool.
-    c, err := p.Acquire()
+    conn, err := pool.Acquire()
     if err != nil {
-        log.Fatalf("Failed to get connection from pool: %v", err)
+        log.Fatalf("acquire: %v", err)
     }
-    defer c.Release()   // Release the connection to the pool.
+    defer conn.Release() // returns the connection to the pool when done
 
-	// Use the connection to send a message.
-    err = c.SendMessage("hi")
+    if err := conn.SendMessage("hello"); err != nil {
+        log.Fatalf("send: %v", err)
+    }
+
+    msg, err := conn.ReadMessage()
     if err != nil {
-        log.Fatalf("Failed to send message: %v", err)
+        log.Fatalf("read: %v", err)
     }
-	
-	// read response
-	res,err := c.ReadMessage()
-	// handle response and error
-
+    log.Printf("response: %s", msg)
 }
 ```
 
